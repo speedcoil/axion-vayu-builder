@@ -1,164 +1,133 @@
-name: Build AxionOS 2.9 - vayu
+name: Build AxionOS for vayu
 
 on:
   workflow_dispatch:
     inputs:
       variant:
-        description: 'Axion package variant'
+        description: 'Axion variant (va, pico, core, gms)'
+        required: true
+        default: va
         type: choice
         options: [va, pico, core, gms]
-        default: va
-        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: axion-vayu-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
-    # Register a Linux x86_64 runner with the android-build label.
-    # Recommended: >= 32 GB RAM and >= 400 GB free SSD space.
-    runs-on: [self-hosted, linux, x64, android-build]
+    # Standard ubuntu-24.04 has only ~14 GB disk. Set AXION_RUNNER to a
+    # GitHub-hosted larger runner label with >= 250 GB free disk for full builds.
+    runs-on: ${{ vars.AXION_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 360
     env:
-      ROM_DIR: ${{ github.workspace }}/axion
-      GH_TOKEN: ${{ github.token }}
-      DEBIAN_FRONTEND: noninteractive
+      WORKDIR: ${{ github.workspace }}/android
+      VAYU_VENDOR_REPO: ${{ vars.VAYU_VENDOR_REPO }}
+      COMMON_VENDOR_REPO: ${{ vars.COMMON_VENDOR_REPO }}
+      VAYU_VENDOR_BRANCH: ${{ vars.VAYU_VENDOR_BRANCH || 'lineage-23.2' }}
+      COMMON_VENDOR_BRANCH: ${{ vars.COMMON_VENDOR_BRANCH || 'lineage-23.2' }}
+      GH_TOKEN: ${{ secrets.VENDOR_TOKEN || github.token }}
+      VARIANT: ${{ inputs.variant }}
 
     steps:
-      - name: Check out workflow repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Check prerequisites
+      - name: Validate runner resources and vendor configuration
         shell: bash
         run: |
           set -euo pipefail
-          for bin in git gh python3 curl java zip unzip; do
-            command -v "$bin" >/dev/null || { echo "Missing $bin on self-hosted runner"; exit 1; }
-          done
-          df -h "$GITHUB_WORKSPACE"
+          df -h .
           free -h
-          git lfs install
-          mkdir -p "$HOME/.local/bin"
-          if ! command -v repo >/dev/null; then
-            curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.local/bin/repo"
-            chmod +x "$HOME/.local/bin/repo"
+          free_gb=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+          if (( free_gb < 250 )); then
+            echo '::error::A full Android ROM build needs substantially more free space. Standard ubuntu-24.04 offers about 14 GB. Configure AXION_RUNNER with a larger GitHub-hosted runner label.'
+            exit 1
           fi
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [[ -z "$VAYU_VENDOR_REPO" || -z "$COMMON_VENDOR_REPO" ]]; then
+            echo '::error::Set VAYU_VENDOR_REPO and COMMON_VENDOR_REPO repository variables first.'
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git git-lfs gh curl wget ca-certificates \
+            build-essential bc bison flex g++-multilib gcc-multilib \
+            libssl-dev libelf-dev libxml2 libxml2-utils liblz4-tool \
+            libncurses-dev lzop pngcrush rsync schedtool \
+            squashfs-tools unzip zip zlib1g-dev python3 python-is-python3 \
+            openjdk-21-jdk
+          git lfs install
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Initialize and sync AxionOS
         shell: bash
         run: |
           set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          mkdir -p "$ROM_DIR"
-          cd "$ROM_DIR"
-          repo init -u https://github.com/AxionAOSP/android.git -b lineage-23.2 --git-lfs
-          repo sync -c --no-tags -j4 --fail-fast
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+          "$HOME/bin/repo" init -u https://github.com/AxionAOSP/android.git -b lineage-23.2 --git-lfs
+          "$HOME/bin/repo" sync -c --no-tags -j4
 
-      - name: Clone missing LineageOS device dependencies with GitHub CLI
+      - name: Clone vayu device and vendor repositories
         shell: bash
         run: |
           set -euo pipefail
-          cd "$ROM_DIR"
-          clone_missing() {
-            local repository="$1" destination="$2"
-            if [[ -d "$destination" ]]; then
-              echo "Already present: $destination"
+          cd "$WORKDIR"
+          clone_if_missing() {
+            local source="$1" path="$2" branch="$3"
+            if [[ -d "$path" ]]; then
+              echo "Found $path; keeping already-synced copy"
             else
-              mkdir -p "$(dirname "$destination")"
-              gh repo clone "$repository" "$destination" -- --branch lineage-23.2 --single-branch
+              mkdir -p "$(dirname "$path")"
+              gh repo clone "$source" "$path" -- --branch "$branch" --single-branch
             fi
           }
-          clone_missing LineageOS/android_device_xiaomi_vayu device/xiaomi/vayu
-          clone_missing LineageOS/android_device_xiaomi_sm8150-common device/xiaomi/sm8150-common
-          clone_missing LineageOS/android_hardware_xiaomi hardware/xiaomi
-          clone_missing LineageOS/android_kernel_xiaomi_sm8150 kernel/xiaomi/sm8150
-          test -f kernel/xiaomi/sm8150/arch/arm64/configs/vendor/xiaomi/vayu.config
-
-      - name: Verify vendor repositories configured
-        shell: bash
-        env:
-          VAYU_VENDOR_REPO: ${{ vars.VAYU_VENDOR_REPO }}
-          COMMON_VENDOR_REPO: ${{ vars.COMMON_VENDOR_REPO }}
-          VENDOR_TOKEN: ${{ secrets.VENDOR_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$VAYU_VENDOR_REPO" && -n "$COMMON_VENDOR_REPO" ]] || {
-            echo 'Set repository variables VAYU_VENDOR_REPO and COMMON_VENDOR_REPO (owner/repository).'
-            exit 1
-          }
-          [[ -n "$VENDOR_TOKEN" ]] || { echo 'Set VENDOR_TOKEN secret (read access to vendor repositories).'; exit 1; }
-
-      - name: Check out proprietary vayu blobs
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.VAYU_VENDOR_REPO }}
-          token: ${{ secrets.VENDOR_TOKEN }}
-          path: axion/vendor/xiaomi/vayu
-          persist-credentials: false
-          lfs: true
-
-      - name: Check out proprietary common blobs
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.COMMON_VENDOR_REPO }}
-          token: ${{ secrets.VENDOR_TOKEN }}
-          path: axion/vendor/xiaomi/sm8150-common
-          persist-credentials: false
-          lfs: true
-
-      - name: Validate vendor and configure AxionOS
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$ROM_DIR"
+          clone_if_missing LineageOS/android_device_xiaomi_vayu device/xiaomi/vayu lineage-23.2
+          clone_if_missing LineageOS/android_device_xiaomi_sm8150-common device/xiaomi/sm8150-common lineage-23.2
+          clone_if_missing LineageOS/android_kernel_xiaomi_sm8150 kernel/xiaomi/sm8150 lineage-23.2
+          clone_if_missing LineageOS/android_hardware_xiaomi hardware/xiaomi lineage-23.2
+          clone_if_missing "$VAYU_VENDOR_REPO" vendor/xiaomi/vayu "$VAYU_VENDOR_BRANCH"
+          clone_if_missing "$COMMON_VENDOR_REPO" vendor/xiaomi/sm8150-common "$COMMON_VENDOR_BRANCH"
           test -f vendor/xiaomi/vayu/BoardConfigVendor.mk
           test -f vendor/xiaomi/sm8150-common/BoardConfigVendor.mk
-          python3 - <<'PY'
-          from pathlib import Path
-          product = Path('device/xiaomi/vayu/lineage_vayu.mk')
-          content = product.read_text()
-          flag = 'TARGET_DISABLE_EPPE := true'
-          if flag not in content:
-              product.write_text(flag + '\n' + content)
-          PY
-          grep -n 'TARGET_DISABLE_EPPE' device/xiaomi/vayu/lineage_vayu.mk
+          test -f kernel/xiaomi/sm8150/arch/arm64/configs/vendor/xiaomi/vayu.config
 
-      - name: Compile AxionOS vayu
+      - name: Configure and build ROM
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$ROM_DIR"
-          export USE_CCACHE=1
-          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
-          export CCACHE_EXEC="$(command -v ccache || true)"
-          . build/envsetup.sh
-          # Ephemeral test keys only; don't publish these as production-signed builds.
+          set -eo pipefail
+          cd "$WORKDIR"
+          # Axion requires this flag in the device product makefile.
+          product_file=device/xiaomi/vayu/lineage_vayu.mk
+          test -f "$product_file"
+          if ! grep -q '^TARGET_DISABLE_EPPE[[:space:]]*:=' "$product_file"; then
+            sed -i '1i TARGET_DISABLE_EPPE := true' "$product_file"
+          fi
+          export USE_CCACHE=0
+          export BUILD_USERNAME=github-actions
+          export BUILD_HOSTNAME=github
+          source build/envsetup.sh
           gk -s
-          axion vayu userdebug '${{ inputs.variant }}'
-          JOBS="$(nproc)"
-          if (( JOBS > 8 )); then JOBS=8; fi
-          ax -br -j"$JOBS" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          axion vayu userdebug "$VARIANT"
+          ax -br -j4 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: Upload AxionOS ZIP
+      - name: Upload ROM ZIP
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: axion-vayu-${{ inputs.variant }}-${{ github.run_number }}
-          path: axion/out/target/product/vayu/*.zip
+          name: axion-vayu-${{ inputs.variant }}
+          path: android/out/target/product/vayu/*.zip
           if-no-files-found: error
-          retention-days: 7
           compression-level: 0
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ github.run_number }}
+          name: axion-vayu-build-log
           path: build.log
           if-no-files-found: ignore
-          retention-days: 7
