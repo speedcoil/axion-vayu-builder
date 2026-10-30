@@ -1,0 +1,84 @@
+name: Compile AxionOS 2.9 for Poco X3 Pro
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 10240
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzma pinentry-program rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+
+      - name: Install Google Repo Tool
+        run: |
+          mkdir -p ~/bin
+          curl https://googleapis.com > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "PATH=$HOME/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Sync AxionOS 2.9 Source Code
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          mkdir axion && cd axion
+          
+          # Инициализируем манифест AxionOS 2.9 (Android 16)
+          repo init -u https://github.com -b axion-2.9 --git-lfs
+          
+          # Скачиваем дерево устройства, общее дерево, ядро и вендорские блобы (ветка lineage-23.2)
+          git clone https://github.com -b lineage-23.2 device/xiaomi/vayu
+          git clone https://github.com -b lineage-23.2 device/xiaomi/sm8150-common
+          git clone https://github.com -b lineage-23.2 kernel/xiaomi/sm8150
+          git clone https://github.com -b lineage-23.2 vendor/xiaomi/vayu
+          git clone https://github.com -b lineage-23.2 vendor/xiaomi/sm8150-common
+
+          # Синхронизируем базовые исходники прошивки
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+      - name: Adapt Device Tree for AxionOS
+        run: |
+          cd axion/device/xiaomi/vayu
+          
+          # 1. Создаем axion_vayu.mk на основе lineage_vayu.mk
+          cp lineage_vayu.mk axion_vayu.mk
+          
+          # Изменяем упоминания lineage на axion внутри конфигурационного файла
+          sed -i 's/lineage_vayu/axion_vayu/g' axion_vayu.mk
+          sed -i 's/lineage.mk/axion.mk/g' axion_vayu.mk
+          sed -i 's/PRODUCT_NAME := vayu/PRODUCT_NAME := axion_vayu/g' axion_vayu.mk
+          
+          # 2. Добавляем axion_vayu в список поддерживаемых продуктов (AndroidProducts.mk)
+          # Сначала очистим файл и запишем конфигурацию начисто
+          echo -e "PRODUCT_MAKEFILES := \\\n    \$(LOCAL_DIR)/axion_vayu.mk" > AndroidProducts.mk
+          
+          # 3. Указываем дефконфиг ядра, о котором вы упомянули (vayu.config)
+          # На всякий случай дублируем его объявление для совместимости с деревом
+          echo "TARGET_KERNEL_CONFIG := vendor/xiaomi/vayu.config" >> BoardConfig.mk
+
+      - name: Execute AxionOS Compilation
+        run: |
+          cd axion
+          source build/envsetup.sh
+          
+          # Инициализируем сборку Axion под vayu
+          lunch axion_vayu-userdebug
+          
+          # Компилируем финальный архив (bacon)
+          mka bacon -j$(nproc --all)
+
+      - name: Upload Compiled ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxionOS-2.9-vayu-A16
+          path: axion/out/target/product/vayu/*.zip
